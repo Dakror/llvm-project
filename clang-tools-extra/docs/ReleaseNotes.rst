@@ -133,6 +133,11 @@ New checks
   Detects incorrect usages of ``std::enable_if`` that don't name the nested
   ``type`` type.
 
+- New :doc:`bugprone-liskov-substitution
+  <clang-tidy/checks/bugprone/liskov-substitution>` check.
+
+  Detects virtual function overrides not calling their parent implementation.
+
 - New :doc:`bugprone-multi-level-implicit-pointer-conversion
   <clang-tidy/checks/bugprone/multi-level-implicit-pointer-conversion>` check.
 
