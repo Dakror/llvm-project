@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "LiskovSubstitutionCheck.h"
-#include "clang/AST/ASTContext.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 
 using namespace clang::ast_matchers;
@@ -15,19 +14,64 @@ using namespace clang::ast_matchers;
 namespace clang::tidy::bugprone {
 
 void LiskovSubstitutionCheck::registerMatchers(MatchFinder *Finder) {
-  // FIXME: Add matchers.
-  Finder->addMatcher(functionDecl().bind("x"), this);
+  Finder->addMatcher(
+      cxxMethodDecl(isOverride(), has(compoundStmt())).bind("func"), this);
+}
+
+static bool findParentCall(const CXXMethodDecl *MatchedDecl, const Stmt *Node,
+                           bool &InConditional) {
+  for (auto const &Child : Node->children()) {
+    if (!Child)
+      continue;
+    if (Child->getStmtClass() == Stmt::IfStmtClass ||
+        Child->getStmtClass() == Stmt::SwitchStmtClass) {
+      if (findParentCall(MatchedDecl, Child, InConditional)) {
+        InConditional = true;
+        return true;
+      }
+    } else if (Child->getStmtClass() == Stmt::CXXMemberCallExprClass) {
+      auto const *Call = static_cast<const CXXMemberCallExpr *>(Child);
+      // check if call references same function in parent
+      auto const *Parent = Call->getMethodDecl();
+      const auto *Corresponding =
+          MatchedDecl->getCorrespondingMethodDeclaredInClass(
+              Parent->getParent(), true);
+      if (Parent->getName() == MatchedDecl->getName() &&
+          Corresponding == Parent &&
+          MatchedDecl->getParent()->isDerivedFrom(Parent->getParent())) {
+        return true;
+      }
+    } else {
+      if (findParentCall(MatchedDecl, Child, InConditional)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 void LiskovSubstitutionCheck::check(const MatchFinder::MatchResult &Result) {
-  // FIXME: Add callback implementation.
-  const auto *MatchedDecl = Result.Nodes.getNodeAs<FunctionDecl>("x");
-  if (!MatchedDecl->getIdentifier() || MatchedDecl->getName().startswith("awesome_"))
+  const auto *MatchedDecl = Result.Nodes.getNodeAs<CXXMethodDecl>("func");
+
+  if (!MatchedDecl->getIdentifier())
     return;
-  diag(MatchedDecl->getLocation(), "function %0 is insufficiently awesome")
-      << MatchedDecl
-      << FixItHint::CreateInsertion(MatchedDecl->getLocation(), "awesome_");
-  diag(MatchedDecl->getLocation(), "insert 'awesome'", DiagnosticIDs::Note);
+
+  bool Conditional = false;
+  if (findParentCall(MatchedDecl, MatchedDecl->getBody(), Conditional)) {
+    if (Conditional) {
+      diag(MatchedDecl->getLocation(),
+           "virtual override function %0 is not calling parent implementation "
+           "unconditionally.")
+          << MatchedDecl;
+    } else {
+      return;
+    }
+  }
+
+  diag(MatchedDecl->getLocation(),
+       "virtual override function %0 is not calling parent implementation.")
+      << MatchedDecl;
 }
 
 } // namespace clang::tidy::bugprone
