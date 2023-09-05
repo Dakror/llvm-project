@@ -18,16 +18,23 @@ void LiskovSubstitutionCheck::registerMatchers(MatchFinder *Finder) {
       cxxMethodDecl(isOverride(), has(compoundStmt())).bind("func"), this);
 }
 
-static bool findParentCall(const CXXMethodDecl *MatchedDecl, const Stmt *Node,
-                           bool &InConditional) {
+enum class Result {
+  NotFound = 0,
+  ParentFound,
+  DependentParentFound,
+  GrandparentFound
+};
+
+static Result findParentCall(const CXXMethodDecl *MatchedDecl,
+                             const Stmt *Node) {
   for (auto const &Child : Node->children()) {
     if (!Child)
       continue;
     if (Child->getStmtClass() == Stmt::IfStmtClass ||
         Child->getStmtClass() == Stmt::SwitchStmtClass) {
-      if (findParentCall(MatchedDecl, Child, InConditional)) {
-        InConditional = true;
-        return true;
+      auto Res = findParentCall(MatchedDecl, Child);
+      if (Res != Result::NotFound) {
+        return Result::DependentParentFound;
       }
     } else if (Child->getStmtClass() == Stmt::CXXMemberCallExprClass) {
       auto const *Call = static_cast<const CXXMemberCallExpr *>(Child);
@@ -36,19 +43,32 @@ static bool findParentCall(const CXXMethodDecl *MatchedDecl, const Stmt *Node,
       const auto *Corresponding =
           MatchedDecl->getCorrespondingMethodDeclaredInClass(
               Parent->getParent(), true);
+      CXXBasePaths Paths;
       if (Parent->getName() == MatchedDecl->getName() &&
           Corresponding == Parent &&
-          MatchedDecl->getParent()->isDerivedFrom(Parent->getParent())) {
-        return true;
+          MatchedDecl->getParent()->isDerivedFrom(Parent->getParent(), Paths)) {
+        // check call path to see if some parent was skipped
+        for (auto const &Path : Paths) {
+          for (auto const &Elem : Path) {
+            auto const *Candidate =
+                MatchedDecl->getCorrespondingMethodDeclaredInClass(
+                    Elem.Base->getType()->getAsCXXRecordDecl(), true);
+            if (Candidate && Candidate != Corresponding) {
+              return Result::GrandparentFound;
+            }
+          }
+        }
+        return Result::ParentFound;
       }
     } else {
-      if (findParentCall(MatchedDecl, Child, InConditional)) {
-        return true;
+      auto Res = findParentCall(MatchedDecl, Child);
+      if (Res != Result::NotFound) {
+        return Res;
       }
     }
   }
 
-  return false;
+  return Result::NotFound;
 }
 
 void LiskovSubstitutionCheck::check(const MatchFinder::MatchResult &Result) {
@@ -57,21 +77,44 @@ void LiskovSubstitutionCheck::check(const MatchFinder::MatchResult &Result) {
   if (!MatchedDecl->getIdentifier())
     return;
 
-  bool Conditional = false;
-  if (findParentCall(MatchedDecl, MatchedDecl->getBody(), Conditional)) {
-    if (Conditional) {
-      diag(MatchedDecl->getLocation(),
-           "virtual override function %0 is not calling parent implementation "
-           "unconditionally.")
-          << MatchedDecl;
-    } else {
-      return;
-    }
+  // check if any parent class has an implementation for the given function
+  CXXBasePaths Paths;
+  if (!MatchedDecl->getParent()->lookupInBases(
+          [&MatchedDecl](const CXXBaseSpecifier *Specifier, CXXBasePath &Path) {
+            const auto *Method =
+                MatchedDecl->getCorrespondingMethodDeclaredInClass(
+                    Specifier->getType()->getAsCXXRecordDecl(), true);
+
+            return Method && Method->hasBody();
+          },
+          Paths)) {
+    return;
   }
 
-  diag(MatchedDecl->getLocation(),
-       "virtual override function %0 is not calling parent implementation.")
-      << MatchedDecl;
+  auto Res = findParentCall(MatchedDecl, MatchedDecl->getBody());
+  switch (Res) {
+  case Result::NotFound: {
+    diag(MatchedDecl->getLocation(),
+         "virtual override function %0 is not calling parent implementation.")
+        << MatchedDecl;
+    break;
+  }
+  case Result::DependentParentFound: {
+    diag(MatchedDecl->getLocation(),
+         "virtual override function %0 is not calling parent implementation "
+         "unconditionally.")
+        << MatchedDecl;
+    break;
+  }
+  case Result::GrandparentFound: {
+    diag(MatchedDecl->getLocation(), "virtual override function %0 is not "
+                                     "calling direct parent implementation")
+        << MatchedDecl;
+    break;
+  }
+  default:
+    break;
+  }
 }
 
 } // namespace clang::tidy::bugprone
