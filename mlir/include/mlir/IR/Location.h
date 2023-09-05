@@ -166,7 +166,7 @@ public:
 /// an object. The corresponding MLIR location is set to UnknownLoc.
 template <typename T>
 inline OpaqueLoc OpaqueLoc::get(T underlyingLocation, MLIRContext *context) {
-  return get(reinterpret_cast<uintptr_t>(underlyingLocation), TypeID::get<T>(),
+  return get((uintptr_t)(underlyingLocation), TypeID::get<T>(),
              UnknownLoc::get(context));
 }
 
