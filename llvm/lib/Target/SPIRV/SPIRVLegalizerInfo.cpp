@@ -125,6 +125,8 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
 
   auto allIntScalars = {s8, s16, s32, s64};
 
+  auto allFloatScalars = {s16, s32, s64};
+
   auto allFloatScalarsAndVectors = {
       s16,   s32,   s64,   v2s16, v2s32, v2s64, v3s16,  v3s32,  v3s64,
       v4s16, v4s32, v4s64, v8s16, v8s32, v8s64, v16s16, v16s32, v16s64};
@@ -205,6 +207,10 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
                                G_ATOMICRMW_UMAX, G_ATOMICRMW_UMIN})
       .legalForCartesianProduct(allIntScalars, allWritablePtrs);
 
+  getActionDefinitionsBuilder(
+      {G_ATOMICRMW_FADD, G_ATOMICRMW_FSUB, G_ATOMICRMW_FMIN, G_ATOMICRMW_FMAX})
+      .legalForCartesianProduct(allFloatScalars, allWritablePtrs);
+
   getActionDefinitionsBuilder(G_ATOMICRMW_XCHG)
       .legalForCartesianProduct(allFloatAndIntScalars, allWritablePtrs);
 
@@ -229,11 +235,16 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
   // Control-flow. In some cases (e.g. constants) s1 may be promoted to s32.
   getActionDefinitionsBuilder(G_BRCOND).legalFor({s1, s32});
 
+  // TODO: Review the target OpenCL and GLSL Extended Instruction Set specs to
+  // tighten these requirements. Many of these math functions are only legal on
+  // specific bitwidths, so they are not selectable for
+  // allFloatScalarsAndVectors.
   getActionDefinitionsBuilder({G_FPOW,
                                G_FEXP,
                                G_FEXP2,
                                G_FLOG,
                                G_FLOG2,
+                               G_FLOG10,
                                G_FABS,
                                G_FMINNUM,
                                G_FMAXNUM,
@@ -259,8 +270,6 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
       allFloatScalarsAndVectors, allIntScalarsAndVectors);
 
   if (ST.canUseExtInstSet(SPIRV::InstructionSet::OpenCL_std)) {
-    getActionDefinitionsBuilder(G_FLOG10).legalFor(allFloatScalarsAndVectors);
-
     getActionDefinitionsBuilder(
         {G_CTTZ, G_CTTZ_ZERO_UNDEF, G_CTLZ, G_CTLZ_ZERO_UNDEF})
         .legalForCartesianProduct(allIntScalarsAndVectors,
@@ -286,8 +295,9 @@ static Register convertPtrToInt(Register Reg, LLT ConvTy, SPIRVType *SpirvType,
   return ConvReg;
 }
 
-bool SPIRVLegalizerInfo::legalizeCustom(LegalizerHelper &Helper,
-                                        MachineInstr &MI) const {
+bool SPIRVLegalizerInfo::legalizeCustom(
+    LegalizerHelper &Helper, MachineInstr &MI,
+    LostDebugLocObserver &LocObserver) const {
   auto Opc = MI.getOpcode();
   MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
   if (!isTypeFoldingSupported(Opc)) {

@@ -28,13 +28,16 @@
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/InferIntRangeInterface.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "mlir/Transforms/InliningUtils.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Base64.h"
+#include "llvm/Support/Casting.h"
 
 #include <cstdint>
 #include <numeric>
@@ -50,17 +53,19 @@ using namespace test;
 Attribute MyPropStruct::asAttribute(MLIRContext *ctx) const {
   return StringAttr::get(ctx, content);
 }
-LogicalResult MyPropStruct::setFromAttr(MyPropStruct &prop, Attribute attr,
-                                        InFlightDiagnostic *diag) {
+
+LogicalResult
+MyPropStruct::setFromAttr(MyPropStruct &prop, Attribute attr,
+                          function_ref<InFlightDiagnostic()> emitError) {
   StringAttr strAttr = dyn_cast<StringAttr>(attr);
   if (!strAttr) {
-    if (diag)
-      *diag << "Expect StringAttr but got " << attr;
+    emitError() << "Expect StringAttr but got " << attr;
     return failure();
   }
   prop.content = strAttr.getValue();
   return success();
 }
+
 llvm::hash_code MyPropStruct::hash() const {
   return hash_value(StringRef(content));
 }
@@ -103,9 +108,9 @@ static void writeToMlirBytecode(::mlir::DialectBytecodeWriter &writer,
     writer.writeVarInt(elt);
 }
 
-static LogicalResult setPropertiesFromAttribute(PropertiesWithCustomPrint &prop,
-                                                Attribute attr,
-                                                InFlightDiagnostic *diagnostic);
+static LogicalResult
+setPropertiesFromAttribute(PropertiesWithCustomPrint &prop, Attribute attr,
+                           function_ref<InFlightDiagnostic()> emitError);
 static DictionaryAttr
 getPropertiesAsAttribute(MLIRContext *ctx,
                          const PropertiesWithCustomPrint &prop);
@@ -114,9 +119,9 @@ static void customPrintProperties(OpAsmPrinter &p,
                                   const PropertiesWithCustomPrint &prop);
 static ParseResult customParseProperties(OpAsmParser &parser,
                                          PropertiesWithCustomPrint &prop);
-static LogicalResult setPropertiesFromAttribute(VersionedProperties &prop,
-                                                Attribute attr,
-                                                InFlightDiagnostic *diagnostic);
+static LogicalResult
+setPropertiesFromAttribute(VersionedProperties &prop, Attribute attr,
+                           function_ref<InFlightDiagnostic()> emitError);
 static DictionaryAttr getPropertiesAsAttribute(MLIRContext *ctx,
                                                const VersionedProperties &prop);
 static llvm::hash_code computeHash(const VersionedProperties &prop);
@@ -124,6 +129,12 @@ static void customPrintProperties(OpAsmPrinter &p,
                                   const VersionedProperties &prop);
 static ParseResult customParseProperties(OpAsmParser &parser,
                                          VersionedProperties &prop);
+static ParseResult
+parseSwitchCases(OpAsmParser &p, DenseI64ArrayAttr &cases,
+                 SmallVectorImpl<std::unique_ptr<Region>> &caseRegions);
+
+static void printSwitchCases(OpAsmPrinter &p, Operation *op,
+                             DenseI64ArrayAttr cases, RegionRange caseRegions);
 
 void test::registerTestDialect(DialectRegistry &registry) {
   registry.insert<TestDialect>();
@@ -227,6 +238,7 @@ void TestDialect::initialize() {
   // unregistered op.
   fallbackEffectOpInterfaces = new TestOpEffectInterfaceFallback;
 }
+
 TestDialect::~TestDialect() {
   delete static_cast<TestOpEffectInterfaceFallback *>(
       fallbackEffectOpInterfaces);
@@ -526,16 +538,17 @@ LogicalResult TestOpWithVariadicResultsAndFolder::fold(
 }
 
 OpFoldResult TestOpInPlaceFold::fold(FoldAdaptor adaptor) {
-  if (adaptor.getOp() && !(*this)->getAttr("attr")) {
+  // Exercise the fact that an operation created with createOrFold should be
+  // allowed to access its parent block.
+  assert(getOperation()->getBlock() &&
+         "expected that operation is not unlinked");
+
+  if (adaptor.getOp() && !getProperties().attr) {
     // The folder adds "attr" if not present.
-    (*this)->setAttr("attr", adaptor.getOp());
+    getProperties().attr = dyn_cast_or_null<IntegerAttr>(adaptor.getOp());
     return getResult();
   }
   return {};
-}
-
-OpFoldResult TestPassthroughFold::fold(FoldAdaptor adaptor) {
-  return getOperand();
 }
 
 OpFoldResult TestOpFoldWithFoldAdaptor::fold(FoldAdaptor adaptor) {
@@ -859,7 +872,7 @@ void CustomResultsNameOp::getAsmResultNames(
   ArrayAttr value = getNames();
   for (size_t i = 0, e = value.size(); i != e; ++i)
     if (auto str = dyn_cast<StringAttr>(value[i]))
-      if (!str.getValue().empty())
+      if (!str.empty())
         setNameFn(getResult(i), str.getValue());
 }
 
@@ -995,7 +1008,7 @@ void LoopBlockOp::getSuccessorRegions(
 
 OperandRange LoopBlockOp::getEntrySuccessorOperands(RegionBranchPoint point) {
   assert(point == getBody());
-  return getInitMutable();
+  return MutableOperandRange(getInitMutable());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1008,6 +1021,13 @@ LoopBlockTerminatorOp::getMutableSuccessorOperands(RegionBranchPoint point) {
     return getExitArgMutable();
   return getNextIterArgMutable();
 }
+
+//===----------------------------------------------------------------------===//
+// SwitchWithNoBreakOp
+//===----------------------------------------------------------------------===//
+
+void TestNoTerminatorOp::getSuccessorRegions(
+    RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {}
 
 //===----------------------------------------------------------------------===//
 // SingleNoTerminatorCustomAsmOp
@@ -1135,23 +1155,20 @@ OpFoldResult ManualCppOpWithFold::fold(ArrayRef<Attribute> attributes) {
 
 static LogicalResult
 setPropertiesFromAttribute(PropertiesWithCustomPrint &prop, Attribute attr,
-                           InFlightDiagnostic *diagnostic) {
+                           function_ref<InFlightDiagnostic()> emitError) {
   DictionaryAttr dict = dyn_cast<DictionaryAttr>(attr);
   if (!dict) {
-    if (diagnostic)
-      *diagnostic << "expected DictionaryAttr to set TestProperties";
+    emitError() << "expected DictionaryAttr to set TestProperties";
     return failure();
   }
   auto label = dict.getAs<mlir::StringAttr>("label");
   if (!label) {
-    if (diagnostic)
-      *diagnostic << "expected StringAttr for key `label`";
+    emitError() << "expected StringAttr for key `label`";
     return failure();
   }
   auto valueAttr = dict.getAs<IntegerAttr>("value");
   if (!valueAttr) {
-    if (diagnostic)
-      *diagnostic << "expected IntegerAttr for key `value`";
+    emitError() << "expected IntegerAttr for key `value`";
     return failure();
   }
 
@@ -1159,6 +1176,7 @@ setPropertiesFromAttribute(PropertiesWithCustomPrint &prop, Attribute attr,
   prop.value = valueAttr.getValue().getSExtValue();
   return success();
 }
+
 static DictionaryAttr
 getPropertiesAsAttribute(MLIRContext *ctx,
                          const PropertiesWithCustomPrint &prop) {
@@ -1168,14 +1186,17 @@ getPropertiesAsAttribute(MLIRContext *ctx,
   attrs.push_back(b.getNamedAttr("value", b.getI32IntegerAttr(prop.value)));
   return b.getDictionaryAttr(attrs);
 }
+
 static llvm::hash_code computeHash(const PropertiesWithCustomPrint &prop) {
   return llvm::hash_combine(prop.value, StringRef(*prop.label));
 }
+
 static void customPrintProperties(OpAsmPrinter &p,
                                   const PropertiesWithCustomPrint &prop) {
   p.printKeywordOrString(*prop.label);
   p << " is " << prop.value;
 }
+
 static ParseResult customParseProperties(OpAsmParser &parser,
                                          PropertiesWithCustomPrint &prop) {
   std::string label;
@@ -1185,25 +1206,47 @@ static ParseResult customParseProperties(OpAsmParser &parser,
   prop.label = std::make_shared<std::string>(std::move(label));
   return success();
 }
+
+static ParseResult
+parseSwitchCases(OpAsmParser &p, DenseI64ArrayAttr &cases,
+                 SmallVectorImpl<std::unique_ptr<Region>> &caseRegions) {
+  SmallVector<int64_t> caseValues;
+  while (succeeded(p.parseOptionalKeyword("case"))) {
+    int64_t value;
+    Region &region = *caseRegions.emplace_back(std::make_unique<Region>());
+    if (p.parseInteger(value) || p.parseRegion(region, /*arguments=*/{}))
+      return failure();
+    caseValues.push_back(value);
+  }
+  cases = p.getBuilder().getDenseI64ArrayAttr(caseValues);
+  return success();
+}
+
+static void printSwitchCases(OpAsmPrinter &p, Operation *op,
+                             DenseI64ArrayAttr cases, RegionRange caseRegions) {
+  for (auto [value, region] : llvm::zip(cases.asArrayRef(), caseRegions)) {
+    p.printNewline();
+    p << "case " << value << ' ';
+    p.printRegion(*region, /*printEntryBlockArgs=*/false);
+  }
+}
+
 static LogicalResult
 setPropertiesFromAttribute(VersionedProperties &prop, Attribute attr,
-                           InFlightDiagnostic *diagnostic) {
+                           function_ref<InFlightDiagnostic()> emitError) {
   DictionaryAttr dict = dyn_cast<DictionaryAttr>(attr);
   if (!dict) {
-    if (diagnostic)
-      *diagnostic << "expected DictionaryAttr to set VersionedProperties";
+    emitError() << "expected DictionaryAttr to set VersionedProperties";
     return failure();
   }
   auto value1Attr = dict.getAs<IntegerAttr>("value1");
   if (!value1Attr) {
-    if (diagnostic)
-      *diagnostic << "expected IntegerAttr for key `value1`";
+    emitError() << "expected IntegerAttr for key `value1`";
     return failure();
   }
   auto value2Attr = dict.getAs<IntegerAttr>("value2");
   if (!value2Attr) {
-    if (diagnostic)
-      *diagnostic << "expected IntegerAttr for key `value2`";
+    emitError() << "expected IntegerAttr for key `value2`";
     return failure();
   }
 
@@ -1211,6 +1254,7 @@ setPropertiesFromAttribute(VersionedProperties &prop, Attribute attr,
   prop.value2 = value2Attr.getValue().getSExtValue();
   return success();
 }
+
 static DictionaryAttr
 getPropertiesAsAttribute(MLIRContext *ctx, const VersionedProperties &prop) {
   SmallVector<NamedAttribute> attrs;
@@ -1219,13 +1263,16 @@ getPropertiesAsAttribute(MLIRContext *ctx, const VersionedProperties &prop) {
   attrs.push_back(b.getNamedAttr("value2", b.getI32IntegerAttr(prop.value2)));
   return b.getDictionaryAttr(attrs);
 }
+
 static llvm::hash_code computeHash(const VersionedProperties &prop) {
   return llvm::hash_combine(prop.value1, prop.value2);
 }
+
 static void customPrintProperties(OpAsmPrinter &p,
                                   const VersionedProperties &prop) {
   p << prop.value1 << " | " << prop.value2;
 }
+
 static ParseResult customParseProperties(OpAsmParser &parser,
                                          VersionedProperties &prop) {
   if (parser.parseInteger(prop.value1) || parser.parseVerticalBar() ||
@@ -1275,6 +1322,21 @@ static void printSumProperty(OpAsmPrinter &printer, Operation *op,
 }
 
 //===----------------------------------------------------------------------===//
+// Tensor/Buffer Ops
+//===----------------------------------------------------------------------===//
+
+void ReadBufferOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  // The buffer operand is read.
+  effects.emplace_back(MemoryEffects::Read::get(), getBuffer(),
+                       SideEffects::DefaultResource::get());
+  // The buffer contents are dumped.
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       SideEffects::DefaultResource::get());
+}
+
+//===----------------------------------------------------------------------===//
 // Test Dataflow
 //===----------------------------------------------------------------------===//
 
@@ -1318,6 +1380,16 @@ void TestStoreWithARegion::getSuccessorRegions(
     regions.emplace_back();
 }
 
+void TestStoreWithALoopRegion::getSuccessorRegions(
+    RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {
+  // Both the operation itself and the region may be branching into the body or
+  // back into the operation itself. It is possible for the operation not to
+  // enter the body.
+  regions.emplace_back(
+      RegionSuccessor(&getBody(), getBody().front().getArguments()));
+  regions.emplace_back();
+}
+
 LogicalResult
 TestVersionedOpA::readProperties(::mlir::DialectBytecodeReader &reader,
                                  ::mlir::OperationState &state) {
@@ -1327,7 +1399,7 @@ TestVersionedOpA::readProperties(::mlir::DialectBytecodeReader &reader,
 
   // Check if we have a version. If not, assume we are parsing the current
   // version.
-  auto maybeVersion = reader.getDialectVersion("test");
+  auto maybeVersion = reader.getDialectVersion<test::TestDialect>();
   if (succeeded(maybeVersion)) {
     // If version is less than 2.0, there is no additional attribute to parse.
     // We can materialize missing properties post parsing before verification.
@@ -1346,6 +1418,17 @@ TestVersionedOpA::readProperties(::mlir::DialectBytecodeReader &reader,
 void TestVersionedOpA::writeProperties(::mlir::DialectBytecodeWriter &writer) {
   auto &prop = getProperties();
   writer.writeAttribute(prop.dims);
+
+  auto maybeVersion = writer.getDialectVersion<test::TestDialect>();
+  if (succeeded(maybeVersion)) {
+    // If version is less than 2.0, there is no additional attribute to write.
+    const auto *version =
+        reinterpret_cast<const TestDialectVersion *>(*maybeVersion);
+    if ((version->major_ < 2)) {
+      llvm::outs() << "downgrading op properties...\n";
+      return;
+    }
+  }
   writer.writeAttribute(prop.modifier);
 }
 
@@ -1357,7 +1440,7 @@ void TestVersionedOpA::writeProperties(::mlir::DialectBytecodeWriter &writer) {
 
   // Check if we have a version. If not, assume we are parsing the current
   // version.
-  auto maybeVersion = reader.getDialectVersion("test");
+  auto maybeVersion = reader.getDialectVersion<test::TestDialect>();
   bool needToParseAnotherInt = true;
   if (succeeded(maybeVersion)) {
     // If version is less than 2.0, there is no additional attribute to parse.
@@ -1374,6 +1457,7 @@ void TestVersionedOpA::writeProperties(::mlir::DialectBytecodeWriter &writer) {
   prop.value2 = value2;
   return success();
 }
+
 void TestOpWithVersionedProperties::writeToMlirBytecode(
     ::mlir::DialectBytecodeWriter &writer,
     const test::VersionedProperties &prop) {

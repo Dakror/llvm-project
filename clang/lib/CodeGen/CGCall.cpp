@@ -72,6 +72,8 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
   case CC_PreserveAll: return llvm::CallingConv::PreserveAll;
   case CC_Swift: return llvm::CallingConv::Swift;
   case CC_SwiftAsync: return llvm::CallingConv::SwiftTail;
+  case CC_M68kRTD: return llvm::CallingConv::M68k_RTD;
+  case CC_PreserveNone: return llvm::CallingConv::PreserveNone;
   }
 }
 
@@ -252,6 +254,12 @@ static CallingConv getCallingConventionForDecl(const ObjCMethodDecl *D,
   if (D->hasAttr<PreserveAllAttr>())
     return CC_PreserveAll;
 
+  if (D->hasAttr<M68kRTDAttr>())
+    return CC_M68kRTD;
+
+  if (D->hasAttr<PreserveNoneAttr>())
+    return CC_PreserveNone;
+
   return CC_C;
 }
 
@@ -298,7 +306,7 @@ CodeGenTypes::arrangeCXXMethodDeclaration(const CXXMethodDecl *MD) {
   setCUDAKernelCallingConvention(FT, CGM, MD);
   auto prototype = FT.getAs<FunctionProtoType>();
 
-  if (MD->isInstance()) {
+  if (MD->isImplicitObjectMemberFunction()) {
     // The abstract case is perfectly fine.
     const CXXRecordDecl *ThisType = TheCXXABI.getThisArgumentTypeForMethod(MD);
     return arrangeCXXMethodType(ThisType, prototype.getTypePtr(), MD);
@@ -448,7 +456,7 @@ CodeGenTypes::arrangeCXXConstructorCall(const CallArgList &args,
 const CGFunctionInfo &
 CodeGenTypes::arrangeFunctionDeclaration(const FunctionDecl *FD) {
   if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD))
-    if (MD->isInstance())
+    if (MD->isImplicitObjectMemberFunction())
       return arrangeCXXMethodDeclaration(MD);
 
   CanQualType FTy = FD->getType()->getCanonicalTypeUnqualified();
@@ -1293,27 +1301,25 @@ static llvm::Value *CreateCoercedLoad(Address Src, llvm::Type *Ty,
   // If coercing a fixed vector to a scalable vector for ABI compatibility, and
   // the types match, use the llvm.vector.insert intrinsic to perform the
   // conversion.
-  if (auto *ScalableDst = dyn_cast<llvm::ScalableVectorType>(Ty)) {
-    if (auto *FixedSrc = dyn_cast<llvm::FixedVectorType>(SrcTy)) {
-      // If we are casting a fixed i8 vector to a scalable 16 x i1 predicate
+  if (auto *ScalableDstTy = dyn_cast<llvm::ScalableVectorType>(Ty)) {
+    if (auto *FixedSrcTy = dyn_cast<llvm::FixedVectorType>(SrcTy)) {
+      // If we are casting a fixed i8 vector to a scalable i1 predicate
       // vector, use a vector insert and bitcast the result.
-      bool NeedsBitcast = false;
-      auto PredType =
-          llvm::ScalableVectorType::get(CGF.Builder.getInt1Ty(), 16);
-      llvm::Type *OrigType = Ty;
-      if (ScalableDst == PredType &&
-          FixedSrc->getElementType() == CGF.Builder.getInt8Ty()) {
-        ScalableDst = llvm::ScalableVectorType::get(CGF.Builder.getInt8Ty(), 2);
-        NeedsBitcast = true;
+      if (ScalableDstTy->getElementType()->isIntegerTy(1) &&
+          ScalableDstTy->getElementCount().isKnownMultipleOf(8) &&
+          FixedSrcTy->getElementType()->isIntegerTy(8)) {
+        ScalableDstTy = llvm::ScalableVectorType::get(
+            FixedSrcTy->getElementType(),
+            ScalableDstTy->getElementCount().getKnownMinValue() / 8);
       }
-      if (ScalableDst->getElementType() == FixedSrc->getElementType()) {
+      if (ScalableDstTy->getElementType() == FixedSrcTy->getElementType()) {
         auto *Load = CGF.Builder.CreateLoad(Src);
-        auto *UndefVec = llvm::UndefValue::get(ScalableDst);
+        auto *UndefVec = llvm::UndefValue::get(ScalableDstTy);
         auto *Zero = llvm::Constant::getNullValue(CGF.CGM.Int64Ty);
         llvm::Value *Result = CGF.Builder.CreateInsertVector(
-            ScalableDst, UndefVec, Load, Zero, "cast.scalable");
-        if (NeedsBitcast)
-          Result = CGF.Builder.CreateBitCast(Result, OrigType);
+            ScalableDstTy, UndefVec, Load, Zero, "cast.scalable");
+        if (ScalableDstTy != Ty)
+          Result = CGF.Builder.CreateBitCast(Result, Ty);
         return Result;
       }
     }
@@ -1376,7 +1382,7 @@ static void CreateCoercedStore(llvm::Value *Src,
   llvm::PointerType *DstPtrTy = llvm::dyn_cast<llvm::PointerType>(DstTy);
   if (SrcPtrTy && DstPtrTy &&
       SrcPtrTy->getAddressSpace() != DstPtrTy->getAddressSpace()) {
-    Src = CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(Src, DstTy);
+    Src = CGF.Builder.CreateAddrSpaceCast(Src, DstTy);
     CGF.Builder.CreateStore(Src, Dst, DstIsVolatile);
     return;
   }
@@ -1763,14 +1769,31 @@ static void AddAttributesFromFunctionProtoType(ASTContext &Ctx,
       FPT->isNothrow())
     FuncAttrs.addAttribute(llvm::Attribute::NoUnwind);
 
-  if (FPT->getAArch64SMEAttributes() & FunctionType::SME_PStateSMEnabledMask)
+  unsigned SMEBits = FPT->getAArch64SMEAttributes();
+  if (SMEBits & FunctionType::SME_PStateSMEnabledMask)
     FuncAttrs.addAttribute("aarch64_pstate_sm_enabled");
-  if (FPT->getAArch64SMEAttributes() & FunctionType::SME_PStateSMCompatibleMask)
+  if (SMEBits & FunctionType::SME_PStateSMCompatibleMask)
     FuncAttrs.addAttribute("aarch64_pstate_sm_compatible");
-  if (FPT->getAArch64SMEAttributes() & FunctionType::SME_PStateZASharedMask)
-    FuncAttrs.addAttribute("aarch64_pstate_za_shared");
-  if (FPT->getAArch64SMEAttributes() & FunctionType::SME_PStateZAPreservedMask)
-    FuncAttrs.addAttribute("aarch64_pstate_za_preserved");
+
+  // ZA
+  if (FunctionType::getArmZAState(SMEBits) == FunctionType::ARM_Preserves)
+    FuncAttrs.addAttribute("aarch64_preserves_za");
+  if (FunctionType::getArmZAState(SMEBits) == FunctionType::ARM_In)
+    FuncAttrs.addAttribute("aarch64_in_za");
+  if (FunctionType::getArmZAState(SMEBits) == FunctionType::ARM_Out)
+    FuncAttrs.addAttribute("aarch64_out_za");
+  if (FunctionType::getArmZAState(SMEBits) == FunctionType::ARM_InOut)
+    FuncAttrs.addAttribute("aarch64_inout_za");
+
+  // ZT0
+  if (FunctionType::getArmZT0State(SMEBits) == FunctionType::ARM_Preserves)
+    FuncAttrs.addAttribute("aarch64_preserves_zt0");
+  if (FunctionType::getArmZT0State(SMEBits) == FunctionType::ARM_In)
+    FuncAttrs.addAttribute("aarch64_in_zt0");
+  if (FunctionType::getArmZT0State(SMEBits) == FunctionType::ARM_Out)
+    FuncAttrs.addAttribute("aarch64_out_zt0");
+  if (FunctionType::getArmZT0State(SMEBits) == FunctionType::ARM_InOut)
+    FuncAttrs.addAttribute("aarch64_inout_zt0");
 }
 
 static void AddAttributesFromAssumes(llvm::AttrBuilder &FuncAttrs,
@@ -2001,6 +2024,43 @@ static void getTrivialDefaultFunctionAttributes(
   }
 }
 
+/// Merges `target-features` from \TargetOpts and \F, and sets the result in
+/// \FuncAttr
+/// * features from \F are always kept
+/// * a feature from \TargetOpts is kept if itself and its opposite are absent
+/// from \F
+static void
+overrideFunctionFeaturesWithTargetFeatures(llvm::AttrBuilder &FuncAttr,
+                                           const llvm::Function &F,
+                                           const TargetOptions &TargetOpts) {
+  auto FFeatures = F.getFnAttribute("target-features");
+
+  llvm::StringSet<> MergedNames;
+  SmallVector<StringRef> MergedFeatures;
+  MergedFeatures.reserve(TargetOpts.Features.size());
+
+  auto AddUnmergedFeatures = [&](auto &&FeatureRange) {
+    for (StringRef Feature : FeatureRange) {
+      if (Feature.empty())
+        continue;
+      assert(Feature[0] == '+' || Feature[0] == '-');
+      StringRef Name = Feature.drop_front(1);
+      bool Merged = !MergedNames.insert(Name).second;
+      if (!Merged)
+        MergedFeatures.push_back(Feature);
+    }
+  };
+
+  if (FFeatures.isValid())
+    AddUnmergedFeatures(llvm::split(FFeatures.getValueAsString(), ','));
+  AddUnmergedFeatures(TargetOpts.Features);
+
+  if (!MergedFeatures.empty()) {
+    llvm::sort(MergedFeatures);
+    FuncAttr.addAttribute("target-features", llvm::join(MergedFeatures, ","));
+  }
+}
+
 void CodeGen::mergeDefaultFunctionDefinitionAttributes(
     llvm::Function &F, const CodeGenOptions &CodeGenOpts,
     const LangOptions &LangOpts, const TargetOptions &TargetOpts,
@@ -2058,6 +2118,9 @@ void CodeGen::mergeDefaultFunctionDefinitionAttributes(
 
   F.removeFnAttrs(AttrsToRemove);
   addDenormalModeAttrs(Merged, MergedF32, FuncAttrs);
+
+  overrideFunctionFeaturesWithTargetFeatures(FuncAttrs, F, TargetOpts);
+
   F.addFnAttrs(FuncAttrs);
 }
 
@@ -2228,6 +2291,17 @@ static llvm::FPClassTest getNoFPClassTestMask(const LangOptions &LangOpts) {
   return Mask;
 }
 
+void CodeGenModule::AdjustMemoryAttribute(StringRef Name,
+                                          CGCalleeInfo CalleeInfo,
+                                          llvm::AttributeList &Attrs) {
+  if (Attrs.getMemoryEffects().getModRef() == llvm::ModRefInfo::NoModRef) {
+    Attrs = Attrs.removeFnAttribute(getLLVMContext(), llvm::Attribute::Memory);
+    llvm::Attribute MemoryAttr = llvm::Attribute::getWithMemoryEffects(
+        getLLVMContext(), llvm::MemoryEffects::writeOnly());
+    Attrs = Attrs.addFnAttribute(getLLVMContext(), MemoryAttr);
+  }
+}
+
 /// Construct the IR attribute list of a function or call.
 ///
 /// When adding an attribute, please consider where it should be handled:
@@ -2391,9 +2465,6 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
 
     if (TargetDecl->hasAttr<ArmLocallyStreamingAttr>())
       FuncAttrs.addAttribute("aarch64_pstate_sm_body");
-
-    if (TargetDecl->hasAttr<ArmNewZAAttr>())
-      FuncAttrs.addAttribute("aarch64_pstate_za_new");
   }
 
   // Attach "no-builtins" attributes to:
@@ -2557,6 +2628,8 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
   if (IRFunctionArgs.hasSRetArg()) {
     llvm::AttrBuilder SRETAttrs(getLLVMContext());
     SRETAttrs.addStructRetAttr(getTypes().ConvertTypeForMem(RetTy));
+    SRETAttrs.addAttribute(llvm::Attribute::Writable);
+    SRETAttrs.addAttribute(llvm::Attribute::DeadOnUnwind);
     hasUsedSRet = true;
     if (RetAI.getInReg())
       SRETAttrs.addAttribute(llvm::Attribute::InReg);
@@ -2585,7 +2658,7 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
     llvm::AttrBuilder Attrs(getLLVMContext());
 
     QualType ThisTy =
-        FI.arg_begin()->type.castAs<PointerType>()->getPointeeType();
+        FI.arg_begin()->type.getTypePtr()->getPointeeType();
 
     if (!CodeGenOpts.NullPointerIsValid &&
         getTypes().getTargetAddressSpace(FI.arg_begin()->type) == 0) {
@@ -2664,7 +2737,8 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
 
       auto *Decl = ParamType->getAsRecordDecl();
       if (CodeGenOpts.PassByValueIsNoAlias && Decl &&
-          Decl->getArgPassingRestrictions() == RecordDecl::APK_CanPassInRegs)
+          Decl->getArgPassingRestrictions() ==
+              RecordArgPassingKind::CanPassInRegs)
         // When calling the function, the pointer passed in will be the only
         // reference to the underlying object. Mark it accordingly.
         Attrs.addAttribute(llvm::Attribute::NoAlias);
@@ -3007,7 +3081,7 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
             // indicates dereferenceability, and if the size is constant we can
             // use the dereferenceable attribute (which requires the size in
             // bytes).
-            if (ArrTy->getSizeModifier() == ArrayType::Static) {
+            if (ArrTy->getSizeModifier() == ArraySizeModifier::Static) {
               QualType ETy = ArrTy->getElementType();
               llvm::Align Alignment =
                   CGM.getNaturalTypeAlignment(ETy).getAsAlign();
@@ -3031,7 +3105,7 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
             // For C99 VLAs with the static keyword, we don't know the size so
             // we can't use the dereferenceable attribute, but in addrspace(0)
             // we know that it must be nonnull.
-            if (ArrTy->getSizeModifier() == VariableArrayType::Static) {
+            if (ArrTy->getSizeModifier() == ArraySizeModifier::Static) {
               QualType ETy = ArrTy->getElementType();
               llvm::Align Alignment =
                   CGM.getNaturalTypeAlignment(ETy).getAsAlign();
@@ -3123,13 +3197,14 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
         llvm::Value *Coerced = Fn->getArg(FirstIRArg);
         if (auto *VecTyFrom =
                 dyn_cast<llvm::ScalableVectorType>(Coerced->getType())) {
-          // If we are casting a scalable 16 x i1 predicate vector to a fixed i8
+          // If we are casting a scalable i1 predicate vector to a fixed i8
           // vector, bitcast the source and use a vector extract.
-          auto PredType =
-              llvm::ScalableVectorType::get(Builder.getInt1Ty(), 16);
-          if (VecTyFrom == PredType &&
+          if (VecTyFrom->getElementType()->isIntegerTy(1) &&
+              VecTyFrom->getElementCount().isKnownMultipleOf(8) &&
               VecTyTo->getElementType() == Builder.getInt8Ty()) {
-            VecTyFrom = llvm::ScalableVectorType::get(Builder.getInt8Ty(), 2);
+            VecTyFrom = llvm::ScalableVectorType::get(
+                VecTyTo->getElementType(),
+                VecTyFrom->getElementCount().getKnownMinValue() / 8);
             Coerced = Builder.CreateBitCast(Coerced, VecTyFrom);
           }
           if (VecTyFrom->getElementType() == VecTyTo->getElementType()) {
@@ -3144,6 +3219,25 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
         }
       }
 
+      llvm::StructType *STy =
+          dyn_cast<llvm::StructType>(ArgI.getCoerceToType());
+      llvm::TypeSize StructSize;
+      llvm::TypeSize PtrElementSize;
+      if (ArgI.isDirect() && !ArgI.getCanBeFlattened() && STy &&
+          STy->getNumElements() > 1) {
+        StructSize = CGM.getDataLayout().getTypeAllocSize(STy);
+        PtrElementSize =
+            CGM.getDataLayout().getTypeAllocSize(ConvertTypeForMem(Ty));
+        if (STy->containsHomogeneousScalableVectorTypes()) {
+          assert(StructSize == PtrElementSize &&
+                 "Only allow non-fractional movement of structure with"
+                 "homogeneous scalable vector type");
+
+          ArgVals.push_back(ParamValue::forDirect(AI));
+          break;
+        }
+      }
+
       Address Alloca = CreateMemTemp(Ty, getContext().getDeclAlign(Arg),
                                      Arg->getName());
 
@@ -3152,7 +3246,6 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
 
       // Fast-isel and the optimizer generally like scalar values better than
       // FCAs, so we flatten them if this is safe to do for this argument.
-      llvm::StructType *STy = dyn_cast<llvm::StructType>(ArgI.getCoerceToType());
       if (ArgI.isDirect() && ArgI.getCanBeFlattened() && STy &&
           STy->getNumElements() > 1) {
         llvm::TypeSize StructSize = CGM.getDataLayout().getTypeAllocSize(STy);
@@ -3451,7 +3544,9 @@ static llvm::StoreInst *findDominatingStoreToReturnValue(CodeGenFunction &CGF) {
       return nullptr;
     // These aren't actually possible for non-coerced returns, and we
     // only care about non-coerced returns on this code path.
-    assert(!SI->isAtomic() && !SI->isVolatile());
+    // All memory instructions inside __try block are volatile.
+    assert(!SI->isAtomic() &&
+           (!SI->isVolatile() || CGF.currentFunctionUsesSEHTry()));
     return SI;
   };
   // If there are multiple uses of the return-value slot, just check
@@ -5213,6 +5308,24 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
         break;
       }
 
+      llvm::StructType *STy =
+          dyn_cast<llvm::StructType>(ArgInfo.getCoerceToType());
+      llvm::Type *SrcTy = ConvertTypeForMem(I->Ty);
+      llvm::TypeSize SrcTypeSize;
+      llvm::TypeSize DstTypeSize;
+      if (STy && ArgInfo.isDirect() && !ArgInfo.getCanBeFlattened()) {
+        SrcTypeSize = CGM.getDataLayout().getTypeAllocSize(SrcTy);
+        DstTypeSize = CGM.getDataLayout().getTypeAllocSize(STy);
+        if (STy->containsHomogeneousScalableVectorTypes()) {
+          assert(SrcTypeSize == DstTypeSize &&
+                 "Only allow non-fractional movement of structure with "
+                 "homogeneous scalable vector type");
+
+          IRCallArgs[FirstIRArg] = I->getKnownRValue().getScalarVal();
+          break;
+        }
+      }
+
       // FIXME: Avoid the conversion through memory if possible.
       Address Src = Address::invalid();
       if (!I->isAggregate()) {
@@ -5228,8 +5341,6 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
 
       // Fast-isel and the optimizer generally like scalar values better than
       // FCAs, so we flatten them if this is safe to do for this argument.
-      llvm::StructType *STy =
-            dyn_cast<llvm::StructType>(ArgInfo.getCoerceToType());
       if (STy && ArgInfo.isDirect() && ArgInfo.getCanBeFlattened()) {
         llvm::Type *SrcTy = Src.getElementType();
         llvm::TypeSize SrcTypeSize =
@@ -5450,11 +5561,18 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
                              /*AttrOnCallSite=*/true,
                              /*IsThunk=*/false);
 
-  if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(CurFuncDecl))
+  if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(CurFuncDecl)) {
     if (FD->hasAttr<StrictFPAttr>())
       // All calls within a strictfp function are marked strictfp
       Attrs = Attrs.addFnAttribute(getLLVMContext(), llvm::Attribute::StrictFP);
 
+    // If -ffast-math is enabled and the function is guarded by an
+    // '__attribute__((optnone)) adjust the memory attribute so the BE emits the
+    // library call instead of the intrinsic.
+    if (FD->hasAttr<OptimizeNoneAttr>() && getLangOpts().FastMath)
+      CGM.AdjustMemoryAttribute(CalleePtr->getName(), Callee.getAbstractInfo(),
+                                Attrs);
+  }
   // Add call-site nomerge attribute if exists.
   if (InNoMergeAttributedStmt)
     Attrs = Attrs.addFnAttribute(getLLVMContext(), llvm::Attribute::NoMerge);
@@ -5542,6 +5660,10 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
     CI = Builder.CreateInvoke(IRFuncTy, CalleePtr, Cont, InvokeDest, IRCallArgs,
                               BundleList);
     EmitBlock(Cont);
+  }
+  if (CI->getCalledFunction() && CI->getCalledFunction()->hasName() &&
+      CI->getCalledFunction()->getName().starts_with("_Z4sqrt")) {
+    SetSqrtFPAccuracy(CI);
   }
   if (callOrInvoke)
     *callOrInvoke = CI;
@@ -5754,12 +5876,13 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
       // If coercing a fixed vector from a scalable vector for ABI
       // compatibility, and the types match, use the llvm.vector.extract
       // intrinsic to perform the conversion.
-      if (auto *FixedDst = dyn_cast<llvm::FixedVectorType>(RetIRTy)) {
+      if (auto *FixedDstTy = dyn_cast<llvm::FixedVectorType>(RetIRTy)) {
         llvm::Value *V = CI;
-        if (auto *ScalableSrc = dyn_cast<llvm::ScalableVectorType>(V->getType())) {
-          if (FixedDst->getElementType() == ScalableSrc->getElementType()) {
+        if (auto *ScalableSrcTy =
+                dyn_cast<llvm::ScalableVectorType>(V->getType())) {
+          if (FixedDstTy->getElementType() == ScalableSrcTy->getElementType()) {
             llvm::Value *Zero = llvm::Constant::getNullValue(CGM.Int64Ty);
-            V = Builder.CreateExtractVector(FixedDst, V, Zero, "cast.fixed");
+            V = Builder.CreateExtractVector(FixedDstTy, V, Zero, "cast.fixed");
             return RValue::get(V);
           }
         }

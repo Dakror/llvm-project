@@ -25,6 +25,9 @@
 #  pragma GCC system_header
 #endif
 
+_LIBCPP_PUSH_MACROS
+#include <__undef_macros>
+
 _LIBCPP_BEGIN_NAMESPACE_STD
 
 struct _LIBCPP_TEMPLATE_VIS once_flag;
@@ -45,7 +48,7 @@ _LIBCPP_HIDE_FROM_ABI void call_once(once_flag&, const _Callable&);
 #endif // _LIBCPP_CXX03_LANG
 
 struct _LIBCPP_TEMPLATE_VIS once_flag {
-  _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR once_flag() _NOEXCEPT : __state_(0) {}
+  _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR once_flag() _NOEXCEPT : __state_(_Unset) {}
   once_flag(const once_flag&)            = delete;
   once_flag& operator=(const once_flag&) = delete;
 
@@ -54,6 +57,10 @@ struct _LIBCPP_TEMPLATE_VIS once_flag {
 #else
   typedef unsigned long _State_type;
 #endif
+
+  static const _State_type _Unset    = 0;
+  static const _State_type _Pending  = 1;
+  static const _State_type _Complete = ~_State_type(0);
 
 private:
   _State_type __state_;
@@ -87,7 +94,7 @@ public:
 private:
   template <size_t... _Indices>
   _LIBCPP_HIDE_FROM_ABI void __execute(__tuple_indices<_Indices...>) {
-    _VSTD::__invoke(_VSTD::get<0>(_VSTD::move(__f_)), _VSTD::get<_Indices>(_VSTD::move(__f_))...);
+    std::__invoke(std::get<0>(std::move(__f_)), std::get<_Indices>(std::move(__f_))...);
   }
 };
 
@@ -117,9 +124,9 @@ _LIBCPP_EXPORTED_FROM_ABI void __call_once(volatile once_flag::_State_type&, voi
 
 template <class _Callable, class... _Args>
 inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, _Callable&& __func, _Args&&... __args) {
-  if (__libcpp_acquire_load(&__flag.__state_) != ~once_flag::_State_type(0)) {
+  if (__libcpp_acquire_load(&__flag.__state_) != once_flag::_Complete) {
     typedef tuple<_Callable&&, _Args&&...> _Gp;
-    _Gp __f(_VSTD::forward<_Callable>(__func), _VSTD::forward<_Args>(__args)...);
+    _Gp __f(std::forward<_Callable>(__func), std::forward<_Args>(__args)...);
     __call_once_param<_Gp> __p(__f);
     std::__call_once(__flag.__state_, &__p, &__call_once_proxy<_Gp>);
   }
@@ -129,7 +136,7 @@ inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, _Callable&& __fun
 
 template <class _Callable>
 inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, _Callable& __func) {
-  if (__libcpp_acquire_load(&__flag.__state_) != ~once_flag::_State_type(0)) {
+  if (__libcpp_acquire_load(&__flag.__state_) != once_flag::_Complete) {
     __call_once_param<_Callable> __p(__func);
     std::__call_once(__flag.__state_, &__p, &__call_once_proxy<_Callable>);
   }
@@ -137,7 +144,7 @@ inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, _Callable& __func
 
 template <class _Callable>
 inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, const _Callable& __func) {
-  if (__libcpp_acquire_load(&__flag.__state_) != ~once_flag::_State_type(0)) {
+  if (__libcpp_acquire_load(&__flag.__state_) != once_flag::_Complete) {
     __call_once_param<const _Callable> __p(__func);
     std::__call_once(__flag.__state_, &__p, &__call_once_proxy<const _Callable>);
   }
@@ -146,5 +153,7 @@ inline _LIBCPP_HIDE_FROM_ABI void call_once(once_flag& __flag, const _Callable& 
 #endif // _LIBCPP_CXX03_LANG
 
 _LIBCPP_END_NAMESPACE_STD
+
+_LIBCPP_POP_MACROS
 
 #endif // _LIBCPP___MUTEX_ONCE_FLAG_H

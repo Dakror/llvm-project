@@ -379,6 +379,8 @@ def imm_neg_XFORM : SDNodeXForm<imm, [{
 def imm_not_XFORM : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant(~(int)N->getZExtValue(), SDLoc(N), MVT::i32);
 }]>;
+def gi_imm_not_XFORM : GICustomOperandRenderer<"renderInvertedImm">,
+  GISDNodeXFormEquiv<imm_not_XFORM>;
 
 // asr_imm_XFORM - Returns a shift immediate with bit {5} set to 1
 def asr_imm_XFORM : SDNodeXForm<imm, [{
@@ -830,8 +832,8 @@ def mod_imm : Operand<i32>, ImmLeaf<i32, [{
 // instructions, which use mod_imm.
 
 def ModImmNotAsmOperand : AsmOperandClass { let Name = "ModImmNot"; }
-def mod_imm_not : Operand<i32>, PatLeaf<(imm), [{
-    return ARM_AM::getSOImmVal(~(uint32_t)N->getZExtValue()) != -1;
+def mod_imm_not : Operand<i32>, ImmLeaf<i32, [{
+    return ARM_AM::getSOImmVal(~(uint32_t)Imm) != -1;
   }], imm_not_XFORM> {
   let ParserMatchClass = ModImmNotAsmOperand;
 }
@@ -4854,7 +4856,7 @@ class AI_crc32<bit C, bits<2> sz, string suffix, SDPatternOperator builtin>
   : AInoP<(outs GPRnopc:$Rd), (ins GPRnopc:$Rn, GPRnopc:$Rm), MiscFrm, NoItinerary,
                !strconcat("crc32", suffix), "\t$Rd, $Rn, $Rm",
                [(set GPRnopc:$Rd, (builtin GPRnopc:$Rn, GPRnopc:$Rm))]>,
-               Requires<[IsARM, HasV8, HasCRC]> {
+               Requires<[IsARM, HasCRC]> {
   bits<4> Rd;
   bits<4> Rn;
   bits<4> Rm;

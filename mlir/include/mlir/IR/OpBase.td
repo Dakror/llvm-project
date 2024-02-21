@@ -451,6 +451,30 @@ class Results<dag rets> {
 }
 
 //===----------------------------------------------------------------------===//
+// Common promised interface constraints
+//===----------------------------------------------------------------------===//
+
+// This constrait represents a promise or an implementation of an attr interface.
+class PromisedAttrInterface<AttrInterface interface> : AttrConstraint<
+  CPred<"$_self.hasPromiseOrImplementsInterface<" #
+    !if(!empty(interface.cppNamespace),
+        "",
+        interface.cppNamespace # "::") # interface.cppInterfaceName #">()">,
+  "promising or implementing the `" # interface.cppInterfaceName # "` attr interface">;
+
+// This predicate checks if the type promises or implementats a type interface.
+class HasPromiseOrImplementsTypeInterface<TypeInterface interface> :
+  CPred<"$_self.hasPromiseOrImplementsInterface<" #
+    !if(!empty(interface.cppNamespace),
+        "",
+        interface.cppNamespace # "::") # interface.cppInterfaceName #">()">;
+
+// This constrait represents a promise or an implementation of a type interface.
+class PromisedTypeInterface<TypeInterface interface> : TypeConstraint<
+  HasPromiseOrImplementsTypeInterface<interface>,
+  "promising or implementing the `" # interface.cppInterfaceName # "` type interface">;
+
+//===----------------------------------------------------------------------===//
 // Common op type constraints
 //===----------------------------------------------------------------------===//
 
@@ -543,6 +567,14 @@ class TypesMatchWith<string summary, string lhsArg, string rhsArg,
   string rhs = rhsArg;
   string transformer = transform;
 }
+
+// The same as TypesMatchWith but if either `lhsArg` or `rhsArg` are optional
+// and not present returns success.
+class OptionalTypesMatchWith<string summary, string lhsArg, string rhsArg,
+                     string transform, string comparator = "std::equal_to<>()">
+  : TypesMatchWith<summary, lhsArg, rhsArg, transform,
+     "!get" # snakeCaseToCamelCase<lhsArg>.ret # "()"
+     # " || !get" # snakeCaseToCamelCase<rhsArg>.ret # "() || " # comparator>;
 
 // Special variant of `TypesMatchWith` that provides a comparator suitable for
 // ranged arguments.

@@ -1,5 +1,5 @@
-! RUN: bbc %s -emit-fir -o - | FileCheck %s
-! RUN: %flang_fc1 -emit-fir %s -o - | FileCheck %s
+! RUN: bbc %s -emit-fir -hlfir=false -o - | FileCheck %s
+! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir %s -o - | FileCheck %s
 
 ! Test Cray Pointers
 
@@ -59,7 +59,6 @@ subroutine cray_derivedType()
 
 ! CHECK: %[[dt:.*]] = fir.alloca !fir.type<_QFcray_derivedtypeTdt{i:i32,j:i32}>
 ! CHECK: %[[k:.*]] = fir.alloca i32 {{.*}}
-! CHECK: %[[pte:.*]] = fir.alloca i32 {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[xdt:.*]] = fir.alloca !fir.type<_QFcray_derivedtypeTdt{i:i32,j:i32}> {{.*}}
 ! CHECK: %[[xdtbox:.*]] = fir.embox %[[xdt]] : (!fir.ref<!fir.type<_QFcray_derivedtypeTdt{i:i32,j:i32}>>) -> !fir.box<!fir.type<_QFcray_derivedtypeTdt{i:i32,j:i32}>>
@@ -107,7 +106,6 @@ subroutine cray_ptrArth()
 
 ! CHECK: %[[dt:.*]] = fir.alloca !fir.type<_QFcray_ptrarthTdt{x:i32,y:i32,z:i32}>
 ! CHECK: %[[i:.*]] = fir.alloca i32 {{.*}}
-! CHECK: %[[pte:.*]] = fir.alloca i32 {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[xdt:.*]] = fir.alloca !fir.type<_QFcray_ptrarthTdt{x:i32,y:i32,z:i32}> {{.*}}
 ! CHECK: %[[xdtbox:.*]] = fir.embox %[[xdt]] : (!fir.ref<!fir.type<_QFcray_ptrarthTdt{x:i32,y:i32,z:i32}>>) -> !fir.box<!fir.type<_QFcray_ptrarthTdt{x:i32,y:i32,z:i32}>>
@@ -154,7 +152,6 @@ subroutine cray_arrayElement()
 
 ! CHECK: %[[data:.*]] = fir.alloca !fir.array<5xi32> {{.*}}
 ! CHECK: %[[k:.*]] = fir.alloca i32 {{.*}}
-! CHECK: %[[pte:.*]] = fir.alloca !fir.array<3xi32> {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[c2:.*]] = arith.constant 2 : i64
 ! CHECK: %[[c1:.*]] = arith.constant 1 : i64
@@ -206,7 +203,6 @@ subroutine cray_2darrayElement()
 
 ! CHECK: %[[data:.*]] = fir.alloca !fir.array<2x4xi32> {{.*}}
 ! CHECK: %[[k:.*]] = fir.alloca i32 {{.*}}
-! CHECK: %[[pte:.*]] = fir.alloca !fir.array<2x3xi32> {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[c2:.*]] = arith.constant 2 : i64
 ! CHECK: %[[c1:.*]] = arith.constant 1 : i64
@@ -269,7 +265,6 @@ subroutine cray_array()
 ! CHECK: %[[c3:.*]] = arith.constant 3 : index
 ! CHECK: %[[k:.*]] = fir.alloca !fir.array<3xi32> {{.*}}
 ! CHECK: %[[c31:.*]] = arith.constant 3 : index
-! CHECK: %[[pte:.*]] = fir.alloca !fir.array<3xi32> {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[c2:.*]] = arith.constant 2 : i64
 ! CHECK: %[[c1:.*]] = arith.constant 1 : i64
@@ -333,7 +328,6 @@ subroutine cray_arraySection()
 ! CHECK: %[[c2:.*]] = arith.constant 2 : index
 ! CHECK: %[[k:.*]] = fir.alloca !fir.array<2xi32> {{.*}}
 ! CHECK: %[[c3:.*]] = arith.constant 3 : index
-! CHECK: %[[pte:.*]] = fir.alloca !fir.array<3xi32> {{.*}}
 ! CHECK: %[[ptr:.*]] = fir.alloca i64 {{.*}}
 ! CHECK: %[[c1:.*]] = arith.constant 2 : i64
 ! CHECK: %[[c0:.*]] = arith.constant 1 : i64
@@ -402,3 +396,47 @@ subroutine cray_arraySection()
 ! CHECK: fir.result %[[arrayupdate]] : !fir.array<3xi32>
 ! CHECK: fir.array_merge_store %[[arrayld]], %[[doloop]] to %[[ld]][%[[slice]]] : !fir.array<3xi32>, !fir.array<3xi32>, !fir.ptr<!fir.array<3xi32>>, !fir.slice<1>
 end
+
+! Test Cray pointer declared in a module
+module mod_cray_ptr
+  integer :: pte
+  pointer(ptr, pte)
+end module
+
+! CHECK-LABEL: @_QPtest_ptr
+subroutine test_ptr()
+  use mod_cray_ptr
+  implicit none
+  integer :: x
+  ptr = loc(x)
+! CHECK: %[[ptr:.*]] = fir.address_of(@_QMmod_cray_ptrEptr) : !fir.ref<i64>
+! CHECK: %[[x:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFtest_ptrEx"}
+! CHECK: %[[box:.*]] = fir.embox %[[x]] : (!fir.ref<i32>) -> !fir.box<i32>
+! CHECK: %[[boxAddr:.*]] = fir.box_addr %[[box]] : (!fir.box<i32>) -> !fir.ref<i32>
+! CHECK: %[[addr_x:.*]] = fir.convert %[[boxAddr]] : (!fir.ref<i32>) -> i64
+! CHECK: fir.store %[[addr_x]] to %[[ptr]] : !fir.ref<i64>
+end
+
+subroutine test_pte()
+  use mod_cray_ptr
+  implicit none
+  integer :: x
+  pte = x
+! CHECK: %[[ptr:.*]] = fir.address_of(@_QMmod_cray_ptrEptr) : !fir.ref<i64>
+! CHECK: %[[x:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFtest_pteEx"}
+! CHECK: %[[xval:.*]] = fir.load %[[x]] : !fir.ref<i32>
+! CHECK: %[[box:.*]] = fir.embox %[[ptr]] : (!fir.ref<i64>) -> !fir.box<i64>
+! CHECK: %[[boxAddr:.*]] = fir.box_addr %[[box]] : (!fir.box<i64>) -> !fir.ref<i64>
+! CHECK: %[[ptr2:.*]] = fir.convert %[[boxAddr]] : (!fir.ref<i64>) -> !fir.ref<!fir.ptr<i32>>
+! CHECK: %[[ptr2val:.*]] = fir.load %[[ptr2]] : !fir.ref<!fir.ptr<i32>>
+! CHECK: fir.store %[[xval]] to %[[ptr2val]] : !fir.ptr<i32>
+
+  x = pte
+! CHECK: %[[box2:.*]] = fir.embox %[[ptr]] : (!fir.ref<i64>) -> !fir.box<i64>
+! CHECK: %[[box2Addr:.*]] = fir.box_addr %[[box2]] : (!fir.box<i64>) -> !fir.ref<i64>
+! CHECK: %[[refptr:.*]] = fir.convert %[[box2Addr]] : (!fir.ref<i64>) -> !fir.ref<!fir.ptr<i32>>
+! CHECK: %[[ptr4:.*]] = fir.load %[[refptr]] : !fir.ref<!fir.ptr<i32>>
+! CHECK: %[[val:.*]] = fir.load %[[ptr4]] : !fir.ptr<i32>
+! CHECK: fir.store %[[val]] to %[[x]] : !fir.ref<i32>
+end
+

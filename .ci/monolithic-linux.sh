@@ -17,14 +17,19 @@ set -ex
 set -o pipefail
 
 MONOREPO_ROOT="${MONOREPO_ROOT:="$(git rev-parse --show-toplevel)"}"
-BUILD_DIR="${BUILD_DIR:=${MONOREPO_ROOT}/build/monolithic-linux}"
-
+BUILD_DIR="${BUILD_DIR:=${MONOREPO_ROOT}/build}"
 rm -rf ${BUILD_DIR}
 
 ccache --zero-stats
-ccache --show-config
+
+if [[ -n "${CLEAR_CACHE:-}" ]]; then
+  echo "clearing cache"
+  ccache --clear
+fi
+
 function show-stats {
-  ccache --print-stats
+  mkdir -p artifacts
+  ccache --print-stats > artifacts/ccache_stats.txt
 }
 trap show-stats EXIT
 
@@ -40,11 +45,13 @@ cmake -S ${MONOREPO_ROOT}/llvm -B ${BUILD_DIR} \
       -D LLVM_ENABLE_ASSERTIONS=ON \
       -D LLVM_BUILD_EXAMPLES=ON \
       -D COMPILER_RT_BUILD_LIBFUZZER=OFF \
-      -D LLVM_LIT_ARGS="-v --xunit-xml-output ${BUILD_DIR}/test-results.xml" \
+      -D LLVM_LIT_ARGS="-v --xunit-xml-output ${BUILD_DIR}/test-results.xml --timeout=1200 --time-tests" \
       -D LLVM_ENABLE_LLD=ON \
       -D CMAKE_CXX_FLAGS=-gmlt \
       -D BOLT_CLANG_EXE=/usr/bin/clang \
-      -D LLVM_CCACHE_BUILD=ON
+      -D LLVM_CCACHE_BUILD=ON \
+      -D MLIR_ENABLE_BINDINGS_PYTHON=ON
 
 echo "--- ninja"
-ninja -C ${BUILD_DIR} ${targets}
+# Targets are not escaped as they are passed as separate arguments.
+ninja -C "${BUILD_DIR}" ${targets}

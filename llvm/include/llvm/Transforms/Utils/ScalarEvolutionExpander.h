@@ -41,6 +41,17 @@ struct SCEVOperand {
   const SCEV* S;
 };
 
+struct PoisonFlags {
+  unsigned NUW : 1;
+  unsigned NSW : 1;
+  unsigned Exact : 1;
+  unsigned Disjoint : 1;
+  unsigned NNeg : 1;
+
+  PoisonFlags(const Instruction *I);
+  void apply(Instruction *I);
+};
+
 /// This class uses information about analyze scalars to rewrite expressions
 /// in canonical form.
 ///
@@ -48,6 +59,8 @@ struct SCEVOperand {
 /// and destroy it when finished to allow the release of the associated
 /// memory.
 class SCEVExpander : public SCEVVisitor<SCEVExpander, Value *> {
+  friend class SCEVExpanderCleaner;
+
   ScalarEvolution &SE;
   const DataLayout &DL;
 
@@ -69,6 +82,10 @@ class SCEVExpander : public SCEVVisitor<SCEVExpander, Value *> {
   /// FIXME: Ideally re-used instructions would not be added to
   /// InsertedValues/InsertedPostIncValues.
   SmallPtrSet<Value *, 16> ReusedValues;
+
+  /// Original flags of instructions for which they were modified. Used
+  /// by SCEVExpanderCleaner to undo changes.
+  DenseMap<AssertingVH<Instruction>, PoisonFlags> OrigFlags;
 
   // The induction variables generated.
   SmallVector<WeakVH, 2> InsertedIVs;
@@ -188,6 +205,7 @@ public:
     InsertedValues.clear();
     InsertedPostIncValues.clear();
     ReusedValues.clear();
+    OrigFlags.clear();
     ChainedPhis.clear();
     InsertedIVs.clear();
   }
@@ -258,6 +276,14 @@ public:
   bool hoistIVInc(Instruction *IncV, Instruction *InsertPos,
                   bool RecomputePoisonFlags = false);
 
+  /// Return true if both increments directly increment the corresponding IV PHI
+  /// nodes and have the same opcode. It is not safe to re-use the flags from
+  /// the original increment, if it is more complex and SCEV expansion may have
+  /// yielded a more simplified wider increment.
+  static bool canReuseFlagsFromOriginalIVInc(PHINode *OrigPhi, PHINode *WidePhi,
+                                             Instruction *OrigInc,
+                                             Instruction *WideInc);
+
   /// replace congruent phis with their most canonical representative. Return
   /// the number of phis eliminated.
   unsigned replaceCongruentIVs(Loop *L, const DominatorTree *DT,
@@ -276,17 +302,16 @@ public:
 
   /// Insert code to directly compute the specified SCEV expression into the
   /// program.  The code is inserted into the specified block.
+  Value *expandCodeFor(const SCEV *SH, Type *Ty, BasicBlock::iterator I);
   Value *expandCodeFor(const SCEV *SH, Type *Ty, Instruction *I) {
-    return expandCodeForImpl(SH, Ty, I);
+    return expandCodeFor(SH, Ty, I->getIterator());
   }
 
   /// Insert code to directly compute the specified SCEV expression into the
   /// program.  The code is inserted into the SCEVExpander's current
   /// insertion point. If a type is specified, the result will be expanded to
   /// have that type, with a cast if necessary.
-  Value *expandCodeFor(const SCEV *SH, Type *Ty = nullptr) {
-    return expandCodeForImpl(SH, Ty);
-  }
+  Value *expandCodeFor(const SCEV *SH, Type *Ty = nullptr);
 
   /// Generates a code sequence that evaluates this predicate.  The inserted
   /// instructions will be at position \p Loc.  The result will be of type i1
@@ -351,6 +376,10 @@ public:
     Builder.SetInsertPoint(IP);
   }
 
+  void setInsertPoint(BasicBlock::iterator IP) {
+    Builder.SetInsertPoint(IP->getParent(), IP);
+  }
+
   /// Clear the current insertion point. This is useful if the instruction
   /// that had been serving as the insertion point may have been deleted.
   void clearInsertPoint() { Builder.ClearInsertionPoint(); }
@@ -392,20 +421,6 @@ public:
 private:
   LLVMContext &getContext() const { return SE.getContext(); }
 
-  /// Insert code to directly compute the specified SCEV expression into the
-  /// program. The code is inserted into the SCEVExpander's current
-  /// insertion point. If a type is specified, the result will be expanded to
-  /// have that type, with a cast if necessary. If \p Root is true, this
-  /// indicates that \p SH is the top-level expression to expand passed from
-  /// an external client call.
-  Value *expandCodeForImpl(const SCEV *SH, Type *Ty);
-
-  /// Insert code to directly compute the specified SCEV expression into the
-  /// program. The code is inserted into the specified block. If \p
-  /// Root is true, this indicates that \p SH is the top-level expression to
-  /// expand passed from an external client call.
-  Value *expandCodeForImpl(const SCEV *SH, Type *Ty, Instruction *I);
-
   /// Recursive helper function for isHighCostExpansion.
   bool isHighCostExpansionHelper(const SCEVOperand &WorkItem, Loop *L,
                                  const Instruction &At, InstructionCost &Cost,
@@ -435,7 +450,7 @@ private:
 
   /// Expand a SCEVAddExpr with a pointer type into a GEP instead of using
   /// ptrtoint+arithmetic+inttoptr.
-  Value *expandAddToGEP(const SCEV *Op, Type *Ty, Value *V);
+  Value *expandAddToGEP(const SCEV *Op, Value *V);
 
   /// Find a previous Value in ExprValueMap for expand.
   /// DropPoisonGeneratingInsts is populated with instructions for which
@@ -445,6 +460,14 @@ private:
       SmallVectorImpl<Instruction *> &DropPoisonGeneratingInsts);
 
   Value *expand(const SCEV *S);
+  Value *expand(const SCEV *S, BasicBlock::iterator I) {
+    setInsertPoint(I);
+    return expand(S);
+  }
+  Value *expand(const SCEV *S, Instruction *I) {
+    setInsertPoint(I);
+    return expand(S);
+  }
 
   /// Determine the most "relevant" loop for the given SCEV.
   const Loop *getRelevantLoop(const SCEV *);
@@ -486,22 +509,31 @@ private:
 
   void rememberInstruction(Value *I);
 
+  void rememberFlags(Instruction *I);
+
   bool isNormalAddRecExprPHI(PHINode *PN, Instruction *IncV, const Loop *L);
 
   bool isExpandedAddRecExprPHI(PHINode *PN, Instruction *IncV, const Loop *L);
 
   Value *expandAddRecExprLiterally(const SCEVAddRecExpr *);
   PHINode *getAddRecExprPHILiterally(const SCEVAddRecExpr *Normalized,
-                                     const Loop *L, Type *ExpandTy, Type *IntTy,
-                                     Type *&TruncTy, bool &InvertStep);
-  Value *expandIVInc(PHINode *PN, Value *StepV, const Loop *L, Type *ExpandTy,
-                     Type *IntTy, bool useSubtract);
+                                     const Loop *L, Type *&TruncTy,
+                                     bool &InvertStep);
+  Value *expandIVInc(PHINode *PN, Value *StepV, const Loop *L,
+                     bool useSubtract);
 
   void fixupInsertPoints(Instruction *I);
 
   /// Create LCSSA PHIs for \p V, if it is required for uses at the Builder's
   /// current insertion point.
   Value *fixupLCSSAFormFor(Value *V);
+
+  /// Replace congruent phi increments with their most canonical representative.
+  /// May swap \p Phi and \p OrigPhi, if \p Phi is more canonical, due to its
+  /// increment.
+  void replaceCongruentIVInc(PHINode *&Phi, PHINode *&OrigPhi, Loop *L,
+                             const DominatorTree *DT,
+                             SmallVectorImpl<WeakTrackingVH> &DeadInsts);
 };
 
 /// Helper to remove instructions inserted during SCEV expansion, unless they

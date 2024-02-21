@@ -42,7 +42,6 @@
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/LLVMDriver.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -102,6 +101,7 @@ bool Demangle;
 static bool DependentLibraries;
 static bool DynRelocs;
 static bool DynamicSymbols;
+static bool ExtraSymInfo;
 static bool FileHeaders;
 static bool Headers;
 static std::vector<std::string> HexDump;
@@ -217,6 +217,7 @@ static void parseOptions(const opt::InputArgList &Args) {
   opts::DynRelocs = Args.hasArg(OPT_dyn_relocations);
   opts::DynamicSymbols = Args.hasArg(OPT_dyn_syms);
   opts::ExpandRelocs = Args.hasArg(OPT_expand_relocs);
+  opts::ExtraSymInfo = Args.hasArg(OPT_extra_sym_info);
   opts::FileHeaders = Args.hasArg(OPT_file_header);
   opts::Headers = Args.hasArg(OPT_headers);
   opts::HexDump = Args.getAllArgValues(OPT_hex_dump_EQ);
@@ -435,7 +436,8 @@ static void dumpObject(ObjectFile &Obj, ScopedPrinter &Writer,
   if (opts::UnwindInfo)
     Dumper->printUnwindInfo();
   if (opts::Symbols || opts::DynamicSymbols)
-    Dumper->printSymbols(opts::Symbols, opts::DynamicSymbols, SymComp);
+    Dumper->printSymbols(opts::Symbols, opts::DynamicSymbols,
+                         opts::ExtraSymInfo, SymComp);
   if (!opts::StringDump.empty())
     Dumper->printSectionsAsString(Obj, opts::StringDump);
   if (!opts::HexDump.empty())
@@ -630,7 +632,6 @@ std::unique_ptr<ScopedPrinter> createWriter() {
 }
 
 int llvm_readobj_main(int argc, char **argv, const llvm::ToolContext &) {
-  InitLLVM X(argc, argv);
   BumpPtrAllocator A;
   StringSaver Saver(A);
   ReadobjOptTable Tbl;

@@ -1,9 +1,11 @@
 #ifndef MLIR_DIALECT_BUFFERIZATION_TRANSFORMS_PASSES_H
 #define MLIR_DIALECT_BUFFERIZATION_TRANSFORMS_PASSES_H
 
+#include "mlir/Dialect/Bufferization/IR/BufferDeallocationOpInterface.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
+class FunctionOpInterface;
 class ModuleOp;
 class RewritePatternSet;
 class OpBuilder;
@@ -26,6 +28,11 @@ struct OneShotBufferizationOptions;
 /// Creates an instance of the BufferDeallocation pass to free all allocated
 /// buffers.
 std::unique_ptr<Pass> createBufferDeallocationPass();
+
+/// Creates an instance of the OwnershipBasedBufferDeallocation pass to free all
+/// allocated buffers.
+std::unique_ptr<Pass> createOwnershipBasedBufferDeallocationPass(
+    DeallocationOptions options = DeallocationOptions());
 
 /// Creates a pass that optimizes `bufferization.dealloc` operations. For
 /// example, it reduces the number of alias checks needed at runtime using
@@ -127,6 +134,10 @@ func::FuncOp buildDeallocationLibraryFunction(OpBuilder &builder, Location loc,
 /// Run buffer deallocation.
 LogicalResult deallocateBuffers(Operation *op);
 
+/// Run the ownership-based buffer deallocation.
+LogicalResult deallocateBuffersOwnershipBased(FunctionOpInterface op,
+                                              DeallocationOptions options);
+
 /// Creates a pass that moves allocations upwards to reduce the number of
 /// required copies that are inserted during the BufferDeallocation pass.
 std::unique_ptr<Pass> createBufferHoistingPass();
@@ -200,9 +211,6 @@ std::unique_ptr<Pass> createBufferizationBufferizePass();
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
-
-/// Register external models for AllocationOpInterface.
-void registerAllocationOpInterfaceExternalModels(DialectRegistry &registry);
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

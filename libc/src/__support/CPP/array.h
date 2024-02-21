@@ -6,17 +6,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIBC_SRC_SUPPORT_CPP_ARRAY_H
-#define LLVM_LIBC_SRC_SUPPORT_CPP_ARRAY_H
+#ifndef LLVM_LIBC_SRC___SUPPORT_CPP_ARRAY_H
+#define LLVM_LIBC_SRC___SUPPORT_CPP_ARRAY_H
 
 #include "src/__support/macros/attributes.h"
 #include <stddef.h> // For size_t.
 
-namespace __llvm_libc {
+namespace LIBC_NAMESPACE {
 namespace cpp {
 
 template <class T, size_t N> struct array {
-  static_assert(N != 0, "Cannot create a __llvm_libc::cpp::array of size 0.");
+  static_assert(N != 0,
+                "Cannot create a LIBC_NAMESPACE::cpp::array of size 0.");
 
   T Data[N];
   using value_type = T;
@@ -27,10 +28,10 @@ template <class T, size_t N> struct array {
   LIBC_INLINE constexpr const T *data() const { return Data; }
 
   LIBC_INLINE constexpr T &front() { return Data[0]; }
-  LIBC_INLINE constexpr T &front() const { return Data[0]; }
+  LIBC_INLINE constexpr const T &front() const { return Data[0]; }
 
   LIBC_INLINE constexpr T &back() { return Data[N - 1]; }
-  LIBC_INLINE constexpr T &back() const { return Data[N - 1]; }
+  LIBC_INLINE constexpr const T &back() const { return Data[N - 1]; }
 
   LIBC_INLINE constexpr T &operator[](size_t Index) { return Data[Index]; }
 
@@ -46,10 +47,10 @@ template <class T, size_t N> struct array {
   LIBC_INLINE constexpr const_iterator begin() const { return Data; }
 
   LIBC_INLINE constexpr iterator end() { return Data + N; }
-  LIBC_INLINE const_iterator end() const { return Data + N; }
+  LIBC_INLINE constexpr const_iterator end() const { return Data + N; }
 };
 
 } // namespace cpp
-} // namespace __llvm_libc
+} // namespace LIBC_NAMESPACE
 
-#endif // LLVM_LIBC_SRC_SUPPORT_CPP_ARRAY_H
+#endif // LLVM_LIBC_SRC___SUPPORT_CPP_ARRAY_H

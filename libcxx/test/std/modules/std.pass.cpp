@@ -7,11 +7,14 @@
 //===----------------------------------------------------------------------===//
 
 // UNSUPPORTED: c++03, c++11, c++14, c++17, c++20
+// UNSUPPORTED: clang-modules-build
+// UNSUPPORTED: gcc
 
-// UNSUPPORTED: libcpp-has-no-std-modules
-// UNSUPPORTED: modules-build
+// XFAIL: has-no-cxx-module-support
 
 // A minimal test to validate import works.
+
+// MODULE_DEPENDENCIES: std
 
 import std;
 
